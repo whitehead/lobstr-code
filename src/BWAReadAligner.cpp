@@ -82,7 +82,7 @@ BWAReadAligner::BWAReadAligner(map<std::string, BWT>* bwt_references,
   _default_opts->max_diff = MATE_MISMATCH;
   _default_opts->max_gapo = MATE_GAPO;
   _default_opts->max_gape = MATE_GAPE;
-  _default_opts->fnr = -1;  // MATE_FNR;
+  _default_opts->fnr = -1;//MATE_FNR;
 
   cigar_debug = false;
   stitch_debug = false;
@@ -94,6 +94,9 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
   read_pair->read2_passed_alignment = false;
   read_pair->found_unique_alignment = false;
   read_pair->aligned_read_num = -1;
+
+  // Keep XA string for multi-mappers
+  string alternate_mappings = "";
 
   if (read_pair->reads.at(0).paired) {
     // all valid alignments for individual reads in the pair
@@ -179,7 +182,8 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
                                     good_left_alignments_read2,
                                     good_right_alignments_read1,
                                     good_right_alignments_read2,
-                                    &index_of_hit, &index_of_mate)) {
+                                    &index_of_hit, &index_of_mate,
+				    &alternate_mappings)) {
           if (align_debug) {
             PrintMessageDieOnError("[BWAReadAligner]: found compatible alignments", DEBUG);
           }
@@ -233,24 +237,31 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
             const ALIGNMENT& ralign = good_right.at(i);
             if (CheckMateAlignment(mate_alignments, lalign, ralign,
                                    &matealign)) {
+	      index_of_hit = i;
               if (!read_pair->found_unique_alignment) {
-                index_of_hit = i;
                 read_pair->found_unique_alignment = true;
               } else {
                 // multiple mapper, more than one good hit
-                if (align_debug) {
-                  PrintMessageDieOnError("[BWAReadAligner]: Discarding: multiple mapper.", DEBUG);
-                }
-                return false;
+		if (allow_multi_mappers) {
+		  stringstream xa;
+		  xa << lalign.chrom << ":" << lalign.start << ";";
+		  alternate_mappings = alternate_mappings + xa.str();
+		} else {
+		  return false;
+		}
               }
-            }
+            } else {
+	      if (align_debug) {
+		PrintMessageDieOnError("Check mate alignment failed", DEBUG);
+	      }
+	    }
           }
         }
       }
 
       // Step 3: Adjust alignment and output
       if (align_debug) {
-        PrintMessageDieOnError("[BWAReadAligner]: adjust alignment and output", DEBUG);
+        PrintMessageDieOnError("[BWAReadAligner]: adjust paired alignment and output", DEBUG);
       }
       if (read_pair->found_unique_alignment) {
         ALIGNMENT final_left_alignment =
@@ -265,18 +276,21 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
                         &final_right_alignment)) {
           if (OutputAlignment(read_pair, final_left_alignment,
 			      final_right_alignment,
-			      matealign, false)) {
+			      matealign, alternate_mappings, false)) {
 	    return true;
 	  }
         } else {
           if (OutputAlignment(read_pair, final_left_alignment,
 			      final_right_alignment,
-			      matealign, true)) {
+			      matealign, alternate_mappings, true)) {
 	    return true;
 	  }
 	}
 	// If we made it this far and didn't align, reset the
 	// read so we don't try again
+	if (align_debug) {
+	  PrintMessageDieOnError("[BWAReadAligner]: Failed to align", DEBUG);
+	}
 	read_pair->reads.at(0).ms_repeat_next_best_period = 0;
 	read_pair->reads.at(1).ms_repeat_next_best_period = 0;
 	return false;
@@ -291,9 +305,20 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
                       &good_left_alignments_read1,
                       &good_right_alignments_read1, err, messages)) {
         // Get rid of multi mappers
-        if (good_left_alignments_read1.size() > 1) {
-          return false;
-        }
+	if (allow_multi_mappers) {
+	  if (good_left_alignments_read1.size() == 0) return false;
+	  if (good_left_alignments_read1.size() > 1) {
+	    for (size_t i = 1; i < good_left_alignments_read1.size(); i++) {
+	      stringstream xa;
+	      xa << good_left_alignments_read1.at(i).chrom << ":" << good_left_alignments_read1.at(i).start << ";";
+	      alternate_mappings = alternate_mappings + xa.str();
+	    }
+	  }
+	} else {
+	  if (good_left_alignments_read1.size() > 1) {
+	    return false;
+	  }
+	}
         if (align_debug) {
           PrintMessageDieOnError("[BWAReadAligner]: checking single end alignment.", DEBUG);
         }
@@ -304,7 +329,7 @@ bool BWAReadAligner::ProcessReadPair(ReadPair* read_pair, string* err, string* m
         ALIGNMENT dummy_matealign;
         if (OutputAlignment(read_pair, good_left_alignments_read1.front(),
 			    good_right_alignments_read1.front(),
-			    dummy_matealign, false)) {
+			    dummy_matealign, alternate_mappings, false)) {
 	  return true;
 	} else {
 	  // reset read so we don't try again
@@ -693,6 +718,14 @@ bool BWAReadAligner::CheckMateAlignment(const vector<ALIGNMENT>&
     const int& str_pos = left_alignment.left ?
       left_alignment.pos : right_alignment.pos;
     // check chrom, pos, and strand
+    if (align_debug) {
+      stringstream msg;
+      msg << "[CheckMateAlignment]: checks "
+	  << it->chrom << ": " << left_alignment.chrom
+	  << " " << abs(it->pos-str_pos) << ": " << MAX_PAIRED_DIFF
+	  << " " << it->strand << ": " << left_alignment.strand;
+      PrintMessageDieOnError(msg.str(), DEBUG);
+    }
     if ((it->chrom == left_alignment.chrom) &&
         (abs(it->pos-str_pos) <= MAX_PAIRED_DIFF) &&
         it->strand != left_alignment.strand) {
@@ -712,7 +745,8 @@ bool BWAReadAligner::FindCompatibleAlignment(const vector<ALIGNMENT>&
                                              const vector<ALIGNMENT>&
                                              good_right2,
                                              size_t* index_of_hit,
-                                             size_t* index_of_mate) {
+                                             size_t* index_of_mate,
+					     string* alternate_mappings) {
   if (align_debug) {
     PrintMessageDieOnError("[FindCompatibleAlignment]: Looking for compatible alignment", DEBUG);
   }
@@ -726,10 +760,13 @@ bool BWAReadAligner::FindCompatibleAlignment(const vector<ALIGNMENT>&
           (l1.strand != l2.strand) &&
           (l1.chrom == l2.chrom)) {
         if (found_unique) {
-          if (align_debug) {
-            PrintMessageDieOnError("[BWAReadAligner]: Multiple mapper", DEBUG);
-          }
-          return false;
+	  if (allow_multi_mappers) {
+	    stringstream xa;
+	    xa << l1.chrom << ":" << l1.start << ";";
+	    *alternate_mappings = *alternate_mappings + xa.str();
+	  } else {
+	    return false;
+	  }
         } else {
           found_unique = true;
           *index_of_hit = i1;
@@ -905,6 +942,7 @@ bool BWAReadAligner::OutputAlignment(ReadPair* read_pair,
                                      const ALIGNMENT& left_alignment,
                                      const ALIGNMENT& right_alignment,
                                      const ALIGNMENT& mate_alignment,
+				     const std::string& alternate_mappings,
                                      bool treat_as_paired) {
   if (align_debug) {
     PrintMessageDieOnError("[BWAReadAligner]: Output alignment", DEBUG);
@@ -931,6 +969,8 @@ bool BWAReadAligner::OutputAlignment(ReadPair* read_pair,
   read_pair->reads.at(aligned_read_num).rStart = right_alignment.pos;
   read_pair->reads.at(aligned_read_num).rEnd = right_alignment.pos +
     read_pair->reads.at(aligned_read_num).right_flank_nuc.length();
+
+  read_pair->alternate_mappings = alternate_mappings;
 
   if (align_debug) {
     PrintMessageDieOnError("[BWAReadAligner]: Checkalignment", DEBUG);
